@@ -65,20 +65,55 @@ fn target_size(w: u32, h: u32) -> (u32, u32) {
     (scaled(w), scaled(h))
 }
 
-/// Downscales when needed, re-encoding as PNG; returns the input unchanged if
-/// anything about the decode or re-encode fails, since an oversized image is
-/// better than no image.
+/// Composites an image carrying an alpha channel onto a white background,
+/// returning an opaque image. These OCR models are trained overwhelmingly on
+/// dark-on-light documents, so white is the only safe ground: a transparent
+/// screenshot (window shadows, rounded corners, a checkbox rendered on a
+/// glass surface) otherwise reaches the model as near-black RGB with the
+/// real content hidden in the alpha channel, and the model confabulates a
+/// confident, wrong transcription instead of failing loudly.
+fn flatten_alpha(img: &image::DynamicImage) -> image::DynamicImage {
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut out = image::RgbImage::new(width, height);
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let [red, green, blue, alpha] = px.0;
+        let alpha_f = f32::from(alpha) / 255.0;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let blend = |channel: u8| -> u8 {
+            (f32::from(channel) * alpha_f + 255.0 * (1.0 - alpha_f)).round() as u8
+        };
+        out.put_pixel(x, y, image::Rgb([blend(red), blend(green), blend(blue)]));
+    }
+    image::DynamicImage::ImageRgb8(out)
+}
+
+/// Flattens alpha and downscales when needed, re-encoding as PNG; returns
+/// the input unchanged if anything about the decode or re-encode fails,
+/// since an oversized or mistranscribable image is better than no image.
+///
+/// Opaque images that need no resize pass through byte-for-byte: re-encoding
+/// them would cost quality and time for no benefit.
 fn normalize(media_type: &'static str, bytes: Vec<u8>) -> DecodedImage {
     let Ok(img) = image::load_from_memory(&bytes) else {
         return DecodedImage { media_type, bytes };
     };
+    let has_alpha = img.color().has_alpha();
+    let img = if has_alpha { flatten_alpha(&img) } else { img };
+
     let (tw, th) = target_size(img.width(), img.height());
-    if (tw, th) == (img.width(), img.height()) {
+    let needs_resize = (tw, th) != (img.width(), img.height());
+    if !has_alpha && !needs_resize {
         return DecodedImage { media_type, bytes };
     }
-    let small = img.thumbnail(tw, th);
+
+    let img = if needs_resize {
+        img.thumbnail(tw, th)
+    } else {
+        img
+    };
     let mut out = std::io::Cursor::new(Vec::new());
-    if small.write_to(&mut out, image::ImageFormat::Png).is_ok() {
+    if img.write_to(&mut out, image::ImageFormat::Png).is_ok() {
         return DecodedImage {
             media_type: "image/png",
             bytes: out.into_inner(),
@@ -133,11 +168,12 @@ pub fn to_data_uri(img: &DecodedImage) -> String {
 mod tests {
     use super::*;
 
-    /// A 1x1 PNG, the smallest real image to exercise the decode paths.
+    /// A 1x1 opaque RGB (no alpha channel) PNG, the smallest real image to
+    /// exercise the decode paths.
     fn tiny_png() -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
             .decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAD0lEQVR4AQEEAPv/AP8AAAMBAQCNHeWCAAAAAElFTkSuQmCC",
             )
             .unwrap()
     }
@@ -211,6 +247,68 @@ mod tests {
 
         // A small image is never upscaled.
         assert_eq!(target_size(800, 600), (800, 600));
+    }
+
+    /// A fully transparent PNG whose alpha channel carries a distinct
+    /// checkerboard pattern while RGB is uniformly mid-gray. If flattening
+    /// worked correctly the "text" (alpha) must survive as visible contrast
+    /// against a white background, and no pixel may remain transparent.
+    fn transparent_checker_png(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let dark = (x / 2 + y / 2) % 2 == 0;
+            let a = if dark { 255 } else { 0 };
+            *px = image::Rgba([10, 10, 10, a]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn transparent_png_is_flattened_onto_white() {
+        let png = transparent_checker_png(8, 8);
+        let decoded = normalize("image/png", png);
+        let out_img = image::load_from_memory(&decoded.bytes).unwrap().to_rgba8();
+
+        // No pixel may remain transparent: the result must be fully opaque.
+        for px in out_img.pixels() {
+            assert_eq!(px.0[3], 255, "pixel still has alpha < 255: {px:?}");
+        }
+        // The previously fully-transparent (alpha=0) cells must now read as
+        // white, not black: compositing onto white, not onto a dark ground.
+        let corner = out_img.get_pixel(2, 0); // (2,0): dark=false -> was transparent
+        assert!(
+            corner.0[0] > 200 && corner.0[1] > 200 && corner.0[2] > 200,
+            "expected near-white background pixel, got {corner:?}"
+        );
+        // The opaque "text" cells must still read as dark.
+        let text_px = out_img.get_pixel(0, 0); // (0,0): dark=true -> was opaque
+        assert!(
+            text_px.0[0] < 60,
+            "expected dark text pixel to survive flattening, got {text_px:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_png_passes_through_byte_for_byte_when_no_resize_needed() {
+        let png = tiny_png();
+        let decoded = normalize("image/png", png.clone());
+        assert_eq!(decoded.bytes, png, "opaque image should not be re-encoded");
+    }
+
+    #[test]
+    fn transparent_and_oversized_image_gets_flattened_and_downscaled() {
+        let png = transparent_checker_png(4000, 3000);
+        let decoded = normalize("image/png", png);
+        let out_img = image::load_from_memory(&decoded.bytes).unwrap();
+        assert!(out_img.width() <= MAX_LONG_EDGE, "width not downscaled");
+        let rgba = out_img.to_rgba8();
+        for px in rgba.pixels() {
+            assert_eq!(px.0[3], 255, "downscaled image still has transparency");
+        }
     }
 
     #[test]

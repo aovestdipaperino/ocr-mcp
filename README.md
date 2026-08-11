@@ -59,6 +59,14 @@ below roughly 1600px wide defeats every model in this weight class. And prefer a
 light background — light-on-dark degrades OCR measurably, because the training
 data is overwhelmingly dark-on-light documents.
 
+Images carrying an alpha channel are flattened onto a white background
+automatically, for the same reason. macOS window captures routinely have
+transparency in their corners and drop shadows, and a PDF-to-PNG pipeline can
+end up with real content living only in the alpha channel and RGB pinned near
+black. Sent as-is, that reads to the model as a page full of near-black
+pixels, and it will confabulate a fluent, entirely wrong transcription rather
+than fail visibly — the worst outcome an OCR tool can produce.
+
 ## Licence
 
 MIT © 2026 Enzo Lombardi
