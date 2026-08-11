@@ -12,7 +12,10 @@ use crate::config::Config;
 use std::io::Write as _;
 use std::path::Path;
 
-/// The quantized GLM-OCR weights.
+/// The quantized GLM-OCR weights, `Q8_0` (the plan's original `Q4_K_M` pair
+/// does not exist in this repo; the brief's URLs 404'd). Confirmed combined
+/// download size for this pair: ~906 MiB + ~462 MiB = ~1.34 GiB (1,434,837,056
+/// bytes), via `curl -sIL <url> | grep -i content-length`.
 pub const MODEL_URL: &str =
     "https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/GLM-OCR-Q8_0.gguf";
 /// The companion multimodal projector. A mismatched projector produces a model
@@ -20,14 +23,19 @@ pub const MODEL_URL: &str =
 pub const MMPROJ_URL: &str =
     "https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/mmproj-GLM-OCR-Q8_0.gguf";
 
+/// Approximate download sizes for the two files above, for the pre-fetch
+/// warning in `fetch`. Not enforced or verified at runtime — just a heads-up.
+const MODEL_SIZE_MIB: u64 = 907;
+const MMPROJ_SIZE_MIB: u64 = 462;
+
 /// Fetches one file to `dest`, via a `.part` file so an interrupted download
 /// never leaves a truncated GGUF that looks complete.
-fn fetch(url: &str, dest: &Path) -> Result<(), String> {
+fn fetch(url: &str, dest: &Path, approx_size_mib: u64) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     let part = dest.with_extension("part");
-    eprintln!("ocr-mcp: downloading {url}");
+    eprintln!("ocr-mcp: downloading {url} (~{approx_size_mib} MiB) -- ctrl-c now to abort");
 
     let mut resp = ureq::get(url).call().map_err(|e| format!("{url}: {e}"))?;
     let mut reader = resp.body_mut().as_reader();
@@ -48,11 +56,14 @@ fn fetch(url: &str, dest: &Path) -> Result<(), String> {
 /// absent, and the next tool call returns the missing-weights error, which is
 /// a far better place to explain the problem than a startup crash.
 pub fn ensure_weights(cfg: &Config) {
-    for (url, dest) in [(MODEL_URL, &cfg.model), (MMPROJ_URL, &cfg.mmproj)] {
+    for (url, dest, approx_size_mib) in [
+        (MODEL_URL, &cfg.model, MODEL_SIZE_MIB),
+        (MMPROJ_URL, &cfg.mmproj, MMPROJ_SIZE_MIB),
+    ] {
         if dest.exists() {
             continue;
         }
-        if let Err(e) = fetch(url, dest) {
+        if let Err(e) = fetch(url, dest, approx_size_mib) {
             eprintln!("ocr-mcp: download failed: {e}");
         }
     }
