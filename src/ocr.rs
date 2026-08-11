@@ -67,7 +67,8 @@ impl std::fmt::Display for OcrError {
                     write!(
                         f,
                         "Set OCR_MCP_AUTO_DOWNLOAD=1 in this server's env to fetch them \
-                         (about 1 GB, once), or download both files by hand."
+                         (about 1.34 GiB, once — on the first transcription), or download \
+                         both files by hand."
                     )
                 }
             }

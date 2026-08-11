@@ -6,7 +6,7 @@
 //!
 //! Invariant: stdout carries JSON-RPC frames and nothing else.
 
-use ocr_mcp::{config::Config, download, llama, mcp};
+use ocr_mcp::{config::Config, llama, mcp};
 
 fn main() {
     let cfg = Config::from_env(&|k| std::env::var(k).ok());
@@ -17,10 +17,8 @@ fn main() {
         cfg.mmproj.display()
     );
 
-    if cfg.auto_download {
-        download::ensure_weights(&cfg);
-    }
-
+    // Nothing that could block the JSON-RPC handshake happens here: any
+    // weight fetch is lazy, gated on the first tool call in `LlamaOcr::describe`.
     let mut engine = llama::LlamaOcr::new(cfg);
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();

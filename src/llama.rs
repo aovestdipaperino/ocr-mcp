@@ -8,53 +8,127 @@
 
 use crate::client;
 use crate::config::Config;
+use crate::download;
 use crate::image_input::DecodedImage;
 use crate::ocr::{OcrEngine, OcrError};
 use crate::server::Child;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long to wait for one transcription before giving up on the child.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// How often the reaper thread wakes to check for an idle child. Small
+/// enough that the idle timeout is honoured promptly, large enough that the
+/// thread spends essentially all of its life parked rather than spinning.
+const REAP_TICK: Duration = Duration::from_secs(5);
+
+/// A background thread that periodically drops the shared child once it has
+/// gone idle. Stopping it (on `Drop`) is immediate: it parks on a channel
+/// `recv_timeout` rather than sleeping, so sending the stop signal wakes it
+/// right away instead of waiting out the next tick.
+struct Reaper {
+    stop: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Reaper {
+    fn spawn(child: Arc<Mutex<Option<Child>>>) -> Self {
+        let (stop, rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(REAP_TICK) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let now = Instant::now();
+                        let mut guard = child.lock().unwrap_or_else(PoisonError::into_inner);
+                        if guard.as_ref().is_some_and(|c| c.should_reap(now)) {
+                            *guard = None;
+                            eprintln!("ocr-mcp: llama-server idle, shut down");
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        // The send only fails if the thread already exited; either way we
+        // still join so no thread outlives this struct.
+        let _ = self.stop.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// An `OcrEngine` backed by a `llama-server` child this struct owns.
+///
+/// The child lives behind `Arc<Mutex<..>>` because both `describe` and the
+/// background [`Reaper`] touch it: `describe` to spawn/use/tear it down, the
+/// reaper to drop it once idle. The lock is never held across the blocking
+/// HTTP request — only to check/set state — so a long transcription never
+/// blocks the reaper thread, and a `busy` flag (set for the request's
+/// duration) stops the reaper from ever winning a race against it.
 pub struct LlamaOcr {
     cfg: Config,
-    child: Option<Child>,
+    child: Arc<Mutex<Option<Child>>>,
+    _reaper: Reaper,
 }
 
 impl LlamaOcr {
-    /// Builds the engine. Nothing is spawned until the first `describe`.
+    /// Builds the engine. Nothing is spawned until the first `describe`; the
+    /// reaper thread starts immediately but does nothing while `child` is
+    /// `None`.
     #[must_use]
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, child: None }
-    }
-
-    /// Drops the child if it has gone unused past the idle timeout, so the
-    /// weights stop occupying RAM in an otherwise idle session.
-    pub fn reap_if_idle(&mut self) {
-        if self
-            .child
-            .as_ref()
-            .is_some_and(|c| c.idle_expired(Instant::now()))
-        {
-            self.child = None;
-            eprintln!("ocr-mcp: llama-server idle, shut down");
+        let child = Arc::new(Mutex::new(None));
+        let reaper = Reaper::spawn(Arc::clone(&child));
+        Self {
+            cfg,
+            child,
+            _reaper: reaper,
         }
     }
 }
 
 impl OcrEngine for LlamaOcr {
     fn describe(&mut self, image: &DecodedImage, prompt: &str) -> Result<String, OcrError> {
-        self.reap_if_idle();
-        if self.child.is_none() {
-            self.child = Some(Child::spawn(&self.cfg)?);
-        }
-        // Unwrap-free: the branch above guarantees it.
-        let Some(child) = self.child.as_mut() else {
-            return Err(OcrError::SpawnFailed("the child vanished".to_string()));
+        // Ensure a live, non-idle child, mark it busy, and grab what the
+        // request needs — all under the lock, none of it blocking.
+        let base_url = {
+            let mut guard = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard
+                .as_ref()
+                .is_some_and(|c| c.should_reap(Instant::now()))
+            {
+                *guard = None;
+            }
+            if guard.is_none() {
+                // Gated on auto_download inside ensure_weights's caller
+                // contract: only fetch when the user opted in. A file that
+                // already exists short-circuits, so a second call here never
+                // re-downloads.
+                if self.cfg.auto_download {
+                    download::ensure_weights(&self.cfg);
+                }
+                *guard = Some(Child::spawn(&self.cfg)?);
+            }
+            let child = guard.as_mut().expect("just ensured Some above");
+            child.touch();
+            child.set_busy(true);
+            child.base_url()
         };
-        child.touch();
-        let url = format!("{}/v1/chat/completions", child.base_url());
+
+        let url = format!("{base_url}/v1/chat/completions");
         let body = client::build_request(image, prompt, self.cfg.max_tokens);
 
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -66,12 +140,22 @@ impl OcrEngine for LlamaOcr {
             .send_json(&body)
             .and_then(|mut r| r.body_mut().read_to_string());
 
+        // Re-acquire only to record completion; the HTTP call above happened
+        // with the lock released.
+        let mut guard = self.child.lock().unwrap_or_else(PoisonError::into_inner);
         match outcome {
-            Ok(text) => client::parse_response(&text),
+            Ok(text) => {
+                if let Some(child) = guard.as_mut() {
+                    child.touch();
+                    child.set_busy(false);
+                }
+                drop(guard);
+                client::parse_response(&text)
+            }
             Err(e) => {
                 // A wedged child is worse than no child: drop it so the next
                 // call starts from a clean server.
-                self.child = None;
+                *guard = None;
                 Err(OcrError::RequestFailed(e.to_string()))
             }
         }

@@ -3,7 +3,8 @@
 An MCP server that transcribes screenshots with a local GLM-OCR 0.9B model.
 
 It spawns `llama-server` on the first tool call, keeps it alive between calls,
-and kills it after five idle minutes so the weights stop occupying RAM.
+and a background reaper thread kills it after five idle minutes so the
+weights stop occupying RAM.
 
 ## Install
 
@@ -17,16 +18,19 @@ and kills it after five idle minutes so the weights stop occupying RAM.
         "ocr": {
           "command": "ocr-mcp",
           "env": {
-            "OCR_MCP_MODEL_DIR": "~/.cache/ocr-mcp",
-            "OCR_MCP_AUTO_DOWNLOAD": "1"
+            "OCR_MCP_MODEL_DIR": "~/.cache/ocr-mcp"
           }
         }
       }
     }
 
-With `OCR_MCP_AUTO_DOWNLOAD` set, the weights (Q8_0, about 1.34 GiB combined)
-are fetched on first start. Without it, the server tells you what to download
-and where to put it.
+Without `OCR_MCP_AUTO_DOWNLOAD` set, the server starts instantly and, the
+first time you ask it to transcribe something without the weights present,
+explains exactly what to download and where to put it. Set
+`OCR_MCP_AUTO_DOWNLOAD=1` to have it fetch the weights itself instead (Q8_0,
+about 1.34 GiB combined) — it does this lazily, right before spawning
+`llama-server` for the first transcription, so the *first call* takes a
+while but startup itself is never delayed.
 
 ## The tool
 

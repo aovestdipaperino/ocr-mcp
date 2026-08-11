@@ -49,6 +49,8 @@ pub fn parse_response(body: &str) -> Result<String, OcrError> {
             "the transcription came back empty".to_string(),
         ));
     }
+    // Trimmed only for the emptiness check above: leading indentation is real
+    // OCR output (e.g. transcribed code), so the untrimmed string is returned.
     Ok(text.to_string())
 }
 

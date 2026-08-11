@@ -148,6 +148,9 @@ pub struct Child {
     last_used: Instant,
     idle: Duration,
     tail: OutputTail,
+    /// Set for the duration of an in-flight request so the idle reaper never
+    /// drops a child a request is actively using.
+    busy: bool,
 }
 
 impl Child {
@@ -194,6 +197,7 @@ impl Child {
             last_used: Instant::now(),
             idle: Duration::from_secs(cfg.idle_secs),
             tail,
+            busy: false,
         };
         child.await_ready()?;
         Ok(child)
@@ -244,6 +248,20 @@ impl Child {
     pub fn idle_expired(&self, now: Instant) -> bool {
         expired(self.last_used, self.idle, now)
     }
+
+    /// Marks the child as actively serving (or having finished) a request.
+    /// While `true`, [`Child::should_reap`] always returns `false`: a request
+    /// in flight must never have its child dropped out from under it.
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
+    /// True when this child is safe to drop: idle-expired and not currently
+    /// serving a request.
+    #[must_use]
+    pub fn should_reap(&self, now: Instant) -> bool {
+        should_reap(self.busy, self.last_used, self.idle, now)
+    }
 }
 
 /// The idle-expiry rule: has `idle` elapsed since `last_used`, as of `now`?
@@ -251,6 +269,13 @@ impl Child {
 /// process.
 fn expired(last_used: Instant, idle: Duration, now: Instant) -> bool {
     now.duration_since(last_used) >= idle
+}
+
+/// The full reaping decision: idle-expired *and* not mid-request. Pulled out
+/// of [`Child::should_reap`] so the reaper/request race can be exercised
+/// without a process.
+fn should_reap(busy: bool, last_used: Instant, idle: Duration, now: Instant) -> bool {
+    !busy && expired(last_used, idle, now)
 }
 
 impl Drop for Child {
@@ -347,6 +372,19 @@ mod tests {
         assert!(!expired(last_used, idle, at(Duration::from_secs(299))));
         assert!(expired(last_used, idle, at(Duration::from_secs(300))));
         assert!(expired(last_used, idle, at(Duration::from_secs(3600))));
+    }
+
+    /// The reaper must never win a race against an in-flight request: a busy
+    /// child is never reaped no matter how idle-expired it looks, because
+    /// `last_used` is only bumped once the request finishes.
+    #[test]
+    fn busy_child_is_never_reaped_even_when_idle_expired() {
+        let idle = Duration::from_secs(300);
+        let last_used = Instant::now();
+        let long_after = last_used + Duration::from_secs(3600);
+        assert!(!should_reap(true, last_used, idle, long_after));
+        assert!(should_reap(false, last_used, idle, long_after));
+        assert!(!should_reap(false, last_used, idle, last_used));
     }
 
     /// Pushing more lines than the cap must keep only the most recent ones,
