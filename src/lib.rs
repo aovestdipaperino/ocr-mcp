@@ -6,7 +6,9 @@
 
 pub mod client;
 pub mod config;
+pub mod download;
 pub mod image_input;
+pub mod llama;
 pub mod mcp;
 pub mod ocr;
 pub mod server;

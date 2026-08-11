@@ -1,9 +1,28 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-use ocr_mcp::config::Config;
+//! Entry point. Every module lives in the library crate; this binary only
+//! wires configuration to the stdio loop.
+//!
+//! Invariant: stdout carries JSON-RPC frames and nothing else.
+
+use ocr_mcp::{config::Config, download, llama, mcp};
 
 fn main() {
     let cfg = Config::from_env(&|k| std::env::var(k).ok());
-    eprintln!("ocr-mcp: model={}", cfg.model.display());
+    eprintln!(
+        "ocr-mcp {} — model {}, projector {}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.model.display(),
+        cfg.mmproj.display()
+    );
+
+    if cfg.auto_download {
+        download::ensure_weights(&cfg);
+    }
+
+    let mut engine = llama::LlamaOcr::new(cfg);
+    let stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout().lock();
+    mcp::serve(std::io::BufReader::new(stdin), stdout, &mut engine);
 }
