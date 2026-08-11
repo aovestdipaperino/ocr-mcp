@@ -11,14 +11,67 @@
 
 use crate::config::Config;
 use crate::ocr::OcrError;
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long to wait for `/health` before giving up on a freshly spawned child.
 const READY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Gap between `/health` polls.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Timeout for a single `/health` liveness probe: it must never let one slow
+/// call push a poll iteration past `READY_TIMEOUT`.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How many of the most recent lines of child output to retain for error
+/// messages.
+const TAIL_CAPACITY: usize = 40;
+
+/// A bounded, thread-safe tail of the most recent lines written by the
+/// child's stdout/stderr, used only to enrich error text.
+#[derive(Clone, Default)]
+struct OutputTail(Arc<Mutex<VecDeque<String>>>);
+
+impl OutputTail {
+    fn push(&self, line: String) {
+        let mut lines = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lines.len() >= TAIL_CAPACITY {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    /// Renders the retained lines, oldest first, joined by newlines.
+    fn snapshot(&self) -> String {
+        let lines = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lines.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Drains `reader` line by line into this tail until EOF. Runs on its
+    /// own thread so the child's pipes never fill and deadlock the process.
+    fn drain(self, reader: impl Read) {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    self.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+}
 
 /// Builds the `llama-server` argument vector.
 ///
@@ -89,6 +142,7 @@ pub struct Child {
     port: u16,
     last_used: Instant,
     idle: Duration,
+    tail: OutputTail,
 }
 
 impl Child {
@@ -111,7 +165,7 @@ impl Child {
         let bin = find_binary(cfg, path_var.as_deref(), &|p| p.exists())?;
         let port = free_port()?;
 
-        let proc = Command::new(&bin)
+        let mut proc = Command::new(&bin)
             .args(build_argv(cfg, port))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -119,11 +173,22 @@ impl Child {
             .spawn()
             .map_err(|e| OcrError::SpawnFailed(format!("{}: {e}", bin.display())))?;
 
+        let tail = OutputTail::default();
+        if let Some(stdout) = proc.stdout.take() {
+            let tail = tail.clone();
+            std::thread::spawn(move || tail.drain(stdout));
+        }
+        if let Some(stderr) = proc.stderr.take() {
+            let tail = tail.clone();
+            std::thread::spawn(move || tail.drain(stderr));
+        }
+
         let mut child = Self {
             proc,
             port,
             last_used: Instant::now(),
             idle: Duration::from_secs(cfg.idle_secs),
+            tail,
         };
         child.await_ready()?;
         Ok(child)
@@ -136,17 +201,25 @@ impl Child {
         while Instant::now() < deadline {
             if let Some(status) = self.proc.try_wait().ok().flatten() {
                 return Err(OcrError::NotReady(format!(
-                    "the process exited early with {status}"
+                    "the process exited early with {status}\n{}",
+                    self.tail.snapshot()
                 )));
             }
-            if ureq::get(&url).call().is_ok() {
+            if ureq::get(&url)
+                .config()
+                .timeout_global(Some(HEALTH_PROBE_TIMEOUT))
+                .build()
+                .call()
+                .is_ok()
+            {
                 return Ok(());
             }
             std::thread::sleep(POLL_INTERVAL);
         }
         Err(OcrError::NotReady(format!(
-            "no answer from {url} after {}s",
-            READY_TIMEOUT.as_secs()
+            "no answer from {url} after {}s\n{}",
+            READY_TIMEOUT.as_secs(),
+            self.tail.snapshot()
         )))
     }
 
@@ -164,8 +237,15 @@ impl Child {
     /// True when the child has gone unused for longer than the idle timeout.
     #[must_use]
     pub fn idle_expired(&self, now: Instant) -> bool {
-        now.duration_since(self.last_used) >= self.idle
+        expired(self.last_used, self.idle, now)
     }
+}
+
+/// The idle-expiry rule: has `idle` elapsed since `last_used`, as of `now`?
+/// Pulled out of [`Child::idle_expired`] so it can be exercised without a
+/// process.
+fn expired(last_used: Instant, idle: Duration, now: Instant) -> bool {
+    now.duration_since(last_used) >= idle
 }
 
 impl Drop for Child {
@@ -258,9 +338,27 @@ mod tests {
     fn idle_expiry_is_measured_from_the_last_use() {
         let idle = Duration::from_mins(5);
         let last_used = Instant::now();
-        let expired = |elapsed: Duration| (last_used + elapsed).duration_since(last_used) >= idle;
-        assert!(!expired(Duration::from_secs(299)));
-        assert!(expired(Duration::from_mins(5)));
-        assert!(expired(Duration::from_hours(1)));
+        let at = |elapsed: Duration| last_used + elapsed;
+        assert!(!expired(last_used, idle, at(Duration::from_secs(299))));
+        assert!(expired(last_used, idle, at(Duration::from_mins(5))));
+        assert!(expired(last_used, idle, at(Duration::from_hours(1))));
+    }
+
+    /// Pushing more lines than the cap must keep only the most recent ones,
+    /// in order, with no process involved.
+    #[test]
+    fn output_tail_keeps_only_the_most_recent_lines() {
+        let tail = OutputTail::default();
+        for i in 0..(TAIL_CAPACITY + 10) {
+            tail.push(format!("line {i}"));
+        }
+        let snapshot = tail.snapshot();
+        let lines: Vec<&str> = snapshot.lines().collect();
+        assert_eq!(lines.len(), TAIL_CAPACITY);
+        assert_eq!(lines.first(), Some(&"line 10"));
+        assert_eq!(
+            lines.last().copied(),
+            Some(format!("line {}", TAIL_CAPACITY + 9)).as_deref()
+        );
     }
 }
