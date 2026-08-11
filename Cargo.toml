@@ -7,8 +7,12 @@ authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 license = "MIT"
 description = "MCP server that transcribes screenshots with a local GLM-OCR model via llama-server"
 repository = "https://github.com/aovestdipaperino/ocr-mcp"
+homepage = "https://github.com/aovestdipaperino/ocr-mcp"
+documentation = "https://docs.rs/ocr-mcp"
+readme = "README.md"
 keywords = ["mcp", "ocr", "llama", "vision"]
-categories = ["command-line-utilities"]
+categories = ["command-line-utilities", "multimedia::images"]
+exclude = ["/.github", "/target"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

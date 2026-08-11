@@ -73,7 +73,7 @@ impl Drop for Reaper {
 /// An `OcrEngine` backed by a `llama-server` child this struct owns.
 ///
 /// The child lives behind `Arc<Mutex<..>>` because both `describe` and the
-/// background [`Reaper`] touch it: `describe` to spawn/use/tear it down, the
+/// background `Reaper` touch it: `describe` to spawn/use/tear it down, the
 /// reaper to drop it once idle. The lock is never held across the blocking
 /// HTTP request — only to check/set state — so a long transcription never
 /// blocks the reaper thread, and a `busy` flag (set for the request's
