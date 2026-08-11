@@ -25,7 +25,9 @@ pub const MMPROJ_URL: &str =
 
 /// Approximate download sizes for the two files above, for the pre-fetch
 /// warning in `fetch`. Not enforced or verified at runtime — just a heads-up.
-const MODEL_SIZE_MIB: u64 = 907;
+/// Measured via `Content-Length`: 950,433,408 bytes / 1,048,576 = 906.36 MiB,
+/// and 484,403,648 bytes / 1,048,576 = 462.02 MiB.
+const MODEL_SIZE_MIB: u64 = 906;
 const MMPROJ_SIZE_MIB: u64 = 462;
 
 /// Fetches one file to `dest`, via a `.part` file so an interrupted download

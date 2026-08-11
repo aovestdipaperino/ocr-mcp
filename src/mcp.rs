@@ -198,10 +198,15 @@ mod tests {
 
     fn png_path() -> std::path::PathBuf {
         use base64::Engine as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let png = base64::engine::general_purpose::STANDARD
             .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
             .unwrap();
-        let dir = std::env::temp_dir().join(format!("ocr-mcp-mcp-{}", std::process::id()));
+        // Each call gets its own file: parallel tests must never share a path,
+        // or one test's write/rewrite can race another test's read.
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ocr-mcp-mcp-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("shot.png");
         std::fs::write(&p, png).unwrap();
