@@ -1,0 +1,20 @@
+[package]
+name = "ocr-mcp"
+version = "0.1.0"
+edition = "2024"
+authors = ["Enzo Lombardi <enzinol@gmail.com>"]
+license = "MIT"
+description = "MCP server that transcribes screenshots with a local GLM-OCR model via llama-server"
+repository = "https://github.com/aovestdipaperino/ocr-mcp"
+keywords = ["mcp", "ocr", "llama", "vision"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+
+[lints.clippy]
+pedantic = "warn"
