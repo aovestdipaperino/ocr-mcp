@@ -9,6 +9,11 @@
 //! speaks JSON-RPC on stdout, and an inherited child's startup banner would
 //! corrupt the framing and wedge the host.
 
+#![allow(
+    clippy::duration_suboptimal_units,
+    reason = "alternatives (from_mins/from_hours) require Rust 1.91; this crate maintains a lower MSRV"
+)]
+
 use crate::config::Config;
 use crate::ocr::OcrError;
 use std::collections::VecDeque;
@@ -19,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long to wait for `/health` before giving up on a freshly spawned child.
-const READY_TIMEOUT: Duration = Duration::from_mins(2);
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Gap between `/health` polls.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Timeout for a single `/health` liveness probe: it must never let one slow
@@ -336,12 +341,12 @@ mod tests {
     /// process and no sleeping.
     #[test]
     fn idle_expiry_is_measured_from_the_last_use() {
-        let idle = Duration::from_mins(5);
+        let idle = Duration::from_secs(300);
         let last_used = Instant::now();
         let at = |elapsed: Duration| last_used + elapsed;
         assert!(!expired(last_used, idle, at(Duration::from_secs(299))));
-        assert!(expired(last_used, idle, at(Duration::from_mins(5))));
-        assert!(expired(last_used, idle, at(Duration::from_hours(1))));
+        assert!(expired(last_used, idle, at(Duration::from_secs(300))));
+        assert!(expired(last_used, idle, at(Duration::from_secs(3600))));
     }
 
     /// Pushing more lines than the cap must keep only the most recent ones,

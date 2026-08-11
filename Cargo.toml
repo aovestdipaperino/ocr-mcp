@@ -2,7 +2,7 @@
 name = "ocr-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.85"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 license = "MIT"
 description = "MCP server that transcribes screenshots with a local GLM-OCR model via llama-server"
