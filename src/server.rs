@@ -78,11 +78,27 @@ impl OutputTail {
     }
 }
 
+/// Context window to allocate. One image is roughly 2700 tokens and the reply
+/// is capped well below `max_tokens`, so this is generous — but it must be set
+/// explicitly, because llama-server otherwise allocates KV for the model's
+/// full 131072-token context. See `build_argv`.
+const CTX_SIZE: u32 = 12000;
+
 /// Builds the `llama-server` argument vector.
 ///
 /// `--flash-attn off` is mandatory: GLM-OCR does not currently work with
 /// flash attention enabled. `--no-warmup` keeps first-spawn latency down,
 /// since the very next thing that happens is a real request.
+///
+/// `--ctx-size` and `--parallel` exist to bound memory, and they matter more
+/// than they look. Left to its defaults llama-server reserves KV for the full
+/// 131072-token context across four parallel slots: 9.78 GB resident for a
+/// 1.4 GB model, held for the entire idle window after every call. This server
+/// is a guest — it typically shares a machine with the far larger model that
+/// called it — and reclaiming that memory when idle is the whole reason it
+/// runs as a separate process. Bounding both measured 2.06 GB with identical
+/// transcriptions and unchanged latency. We serve one request at a time, so
+/// the extra slots buy nothing.
 #[must_use]
 pub fn build_argv(cfg: &Config, port: u16) -> Vec<String> {
     vec![
@@ -94,6 +110,10 @@ pub fn build_argv(cfg: &Config, port: u16) -> Vec<String> {
         port.to_string(),
         "--host".into(),
         "127.0.0.1".into(),
+        "--ctx-size".into(),
+        CTX_SIZE.to_string(),
+        "--parallel".into(),
+        "1".into(),
         "--no-warmup".into(),
         "--flash-attn".into(),
         "off".into(),
@@ -321,6 +341,24 @@ mod tests {
         assert_eq!(pair("--mmproj").as_deref(), Some("/w/glm-ocr-mmproj.gguf"));
         assert_eq!(pair("--port").as_deref(), Some("8123"));
         assert!(argv.iter().any(|a| a == "--no-warmup"));
+    }
+
+    /// The context and slot count must be bounded explicitly. Left to its
+    /// defaults, llama-server allocates KV for the model's full 131072-token
+    /// context across 4 parallel slots — measured at 9.78 GB resident for a
+    /// 1.4 GB model, held for the whole idle window. On a machine also hosting
+    /// an 81 GB ds4, that eviction is what drags the host model into swap.
+    /// Bounding it measured 2.06 GB with identical output and latency.
+    #[test]
+    fn argv_bounds_context_and_slots() {
+        let argv = build_argv(&cfg(), 8123);
+        let pair = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
+        };
+        assert_eq!(pair("--ctx-size").as_deref(), Some("12000"));
+        assert_eq!(pair("--parallel").as_deref(), Some("1"));
     }
 
     #[test]
