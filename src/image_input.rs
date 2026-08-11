@@ -10,12 +10,24 @@
 
 use base64::Engine as _;
 
-/// The long edge is capped here before base64 encoding, so a 5K screenshot
-/// does not become a multi-megabyte JSON body.
-const MAX_LONG_EDGE: u32 = 2600;
-/// Monospace text below roughly this width is where 1B-class OCR falls apart,
-/// so the short edge is never reduced past it.
-const MIN_SHORT_EDGE: u32 = 1600;
+/// Maximum pixel area sent to the model.
+///
+/// The binding limit is **area**, not either edge: the vision encoder emits
+/// image tokens in proportion to pixel count, and past roughly 2700 tokens
+/// GLM-OCR stops transcribing and starts confabulating — fluent text with no
+/// relation to the image. Worse, an oversized image poisons the `llama-server`
+/// process: every subsequent request on that child returns garbage too, so one
+/// large screenshot ruins a whole session.
+///
+/// Measured on this model: 2318x902 (2.09 MP, 2678 tokens) transcribes
+/// correctly; 2322x1268 (2.94 MP, 3757 tokens) fails and poisons the server;
+/// the same image at 1.77 MP and below transcribes correctly. This cap sits
+/// below the lowest known-bad point with margin to spare, and legibility has
+/// room: that image still transcribed correctly down to 0.55 MP.
+///
+/// A cap on the long edge cannot do this job — a 2322x1268 grab is 40% more
+/// area than a 2318x902 one at the same width.
+const MAX_PIXELS: u32 = 1_750_000;
 
 /// An image ready to encode into a request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,28 +52,26 @@ pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
 
 /// Chooses output dimensions for `(w, h)`.
 ///
-/// The long edge is capped at `MAX_LONG_EDGE`, but never at the cost of
-/// pushing the short edge below `MIN_SHORT_EDGE`: a tall terminal capture
-/// scaled to fit its height would end up unreadably narrow, which is exactly
-/// the failure this function exists to prevent. Images already small enough
-/// are returned untouched — nothing is ever upscaled.
+/// Scales `(w, h)` down until its area fits `MAX_PIXELS`, preserving the
+/// aspect ratio. Images already within the cap are returned untouched, and
+/// nothing is ever upscaled.
+///
+/// Area is the right invariant because image tokens scale with pixel count.
+/// An earlier version capped the long edge and enforced a minimum short edge,
+/// which let a 2322x1268 screenshot through at 2.94 MP — enough to make the
+/// model confabulate and to poison the server for every later request. See
+/// `MAX_PIXELS`.
 #[must_use]
 fn target_size(w: u32, h: u32) -> (u32, u32) {
-    let long = w.max(h);
-    if long <= MAX_LONG_EDGE {
+    let area = u64::from(w) * u64::from(h);
+    if area <= u64::from(MAX_PIXELS) || w == 0 || h == 0 {
         return (w, h);
     }
-    let by_long = f64::from(MAX_LONG_EDGE) / f64::from(long);
-    let short = w.min(h);
-    let scale = if f64::from(short) * by_long < f64::from(MIN_SHORT_EDGE) {
-        // Refuse to shrink past the floor; if the short edge is already below
-        // it, `min` with 1.0 leaves the image alone.
-        (f64::from(MIN_SHORT_EDGE) / f64::from(short)).min(1.0)
-    } else {
-        by_long
-    };
+    // Both edges shrink by sqrt of the area ratio, so the shape is preserved.
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (f64::from(MAX_PIXELS) / area as f64).sqrt();
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let scaled = |v: u32| ((f64::from(v) * scale).round() as u32).max(1);
+    let scaled = |v: u32| ((f64::from(v) * scale).floor() as u32).max(1);
     (scaled(w), scaled(h))
 }
 
@@ -233,20 +243,40 @@ mod tests {
     }
 
     /// Downscaling happens only here, at the last moment before base64
-    /// encoding. A tall, narrow capture must not have its short edge pushed
-    /// below the legibility floor to satisfy the long-edge cap.
+    /// encoding. Area is the binding limit, because image tokens scale with
+    /// pixel count and an over-token image makes the model confabulate and
+    /// poisons the server for every later request.
     #[test]
-    fn tall_narrow_capture_keeps_its_short_edge_above_the_floor() {
-        let (w, h) = target_size(1700, 9000);
-        assert!(w >= MIN_SHORT_EDGE, "width {w} fell below the floor");
-        assert!(h <= 9000);
+    fn every_shape_is_capped_by_area() {
+        for (w, h) in [
+            (2322, 1268), // the measured failure: 2.94 MP, poisoned the server
+            (1700, 9000), // long scrollback grab
+            (6000, 4000), // a 24 MP photo
+            (9000, 1700), // the same tall case, rotated
+        ] {
+            let (ow, oh) = target_size(w, h);
+            let area = u64::from(ow) * u64::from(oh);
+            assert!(
+                area <= u64::from(MAX_PIXELS),
+                "{w}x{h} -> {ow}x{oh} = {area}px exceeds the cap"
+            );
+            // Aspect ratio must survive: squashing text is worse than shrinking it.
+            let before = f64::from(w) / f64::from(h);
+            let after = f64::from(ow) / f64::from(oh);
+            assert!(
+                (before - after).abs() / before < 0.01,
+                "{w}x{h} -> {ow}x{oh} distorted the aspect ratio"
+            );
+        }
+    }
 
-        // A genuinely huge image in both axes still gets capped.
-        let (w, h) = target_size(6000, 4000);
-        assert!(w <= MAX_LONG_EDGE && h <= MAX_LONG_EDGE);
-
-        // A small image is never upscaled.
+    /// Anything already within the cap is passed through untouched — no
+    /// upscaling, and no needless re-encode.
+    #[test]
+    fn images_within_the_cap_are_untouched() {
         assert_eq!(target_size(800, 600), (800, 600));
+        // The known-good measured case: 2318x902 = 2.09 MP.
+        assert_eq!(target_size(1400, 1200), (1400, 1200));
     }
 
     /// A fully transparent PNG whose alpha channel carries a distinct
@@ -304,7 +334,8 @@ mod tests {
         let png = transparent_checker_png(4000, 3000);
         let decoded = normalize("image/png", png);
         let out_img = image::load_from_memory(&decoded.bytes).unwrap();
-        assert!(out_img.width() <= MAX_LONG_EDGE, "width not downscaled");
+        let area = u64::from(out_img.width()) * u64::from(out_img.height());
+        assert!(area <= u64::from(MAX_PIXELS), "not downscaled: {area}px");
         let rgba = out_img.to_rgba8();
         for px in rgba.pixels() {
             assert_eq!(px.0[3], 255, "downscaled image still has transparency");
