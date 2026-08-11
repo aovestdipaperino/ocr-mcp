@@ -51,7 +51,7 @@ confabulate if you ask it whether a user interface looks right.
 | `OCR_MCP_BINARY` | *(PATH lookup)* | Explicit `llama-server` path |
 | `OCR_MCP_IDLE_SECS` | `300` | Kill the child after this long unused |
 | `OCR_MCP_MAX_TOKENS` | `1024` | Cap on transcription length |
-| `OCR_MCP_AUTO_DOWNLOAD` | unset | Fetch missing weights on first start |
+| `OCR_MCP_AUTO_DOWNLOAD` | unset | Fetch missing weights on the first transcription |
 
 Pointing `OCR_MCP_MODEL` and `OCR_MCP_MMPROJ` at a different llama.cpp-supported
 vision model works, and is the supported way to trade size for capability.
