@@ -6,3 +6,4 @@
 
 pub mod config;
 pub mod image_input;
+pub mod ocr;
