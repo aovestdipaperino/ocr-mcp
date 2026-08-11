@@ -58,10 +58,22 @@ vision model works, and is the supported way to trade size for capability.
 
 ## Accuracy notes
 
-Two things matter more than the model choice. Capture at 2x: monospace text
-below roughly 1600px wide defeats every model in this weight class. And prefer a
-light background — light-on-dark degrades OCR measurably, because the training
-data is overwhelmingly dark-on-light documents.
+**Images are capped at 1.75 megapixels**, and that ceiling matters more than
+resolution does. Image tokens scale with pixel count, and past roughly 2700 of
+them this model stops transcribing and starts confabulating — fluent text with
+no relation to the image, and nothing to signal that it happened. An oversized
+image also poisons the `llama-server` child, so every later request in the
+session returns garbage too. The cap exists to make both impossible; you should
+not need to think about it.
+
+Resolution below the cap has proved far less fragile than expected: a 2322x1268
+screenshot transcribed correctly all the way down to 0.55 MP. Sharpness helps
+on dense small type, but it is not the first thing to suspect.
+
+Light-on-dark terminal captures are widely reported to degrade OCR at this model
+size, since the training data is overwhelmingly dark-on-light documents. Dark
+screenshots transcribe correctly here once they are within the cap, so treat
+this as a last resort rather than a first explanation.
 
 Images carrying an alpha channel are flattened onto a white background
 automatically, for the same reason. macOS window captures routinely have
