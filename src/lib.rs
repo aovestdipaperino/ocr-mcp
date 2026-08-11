@@ -5,3 +5,4 @@
 //! GLM-OCR model, spawning `llama-server` on demand.
 
 pub mod config;
+pub mod image_input;
