@@ -2,6 +2,8 @@
 
 # ocr-mcp
 
+[![GitHub stars](https://img.shields.io/github/stars/aovestdipaperino/ocr-mcp?logo=github&color=brightgreen)](https://github.com/aovestdipaperino/ocr-mcp/stargazers)
+
 [![crates.io](https://img.shields.io/crates/v/ocr-mcp.svg)](https://crates.io/crates/ocr-mcp)
 [![docs.rs](https://img.shields.io/docsrs/ocr-mcp)](https://docs.rs/ocr-mcp)
 [![licence](https://img.shields.io/crates/l/ocr-mcp.svg)](LICENSE)
